@@ -1,0 +1,206 @@
+# SeaweedFS-only deployment values, derived from plan.md ("Initial Implementation:
+# Simplest Practical Architecture").
+#
+# Scope: this file configures ONLY the SeaweedFS chart (master/volume/filer).
+# PostgreSQL is deployed separately (per the plan, via Crunchy PGO on the same
+# 5 nodes but on independent local storage) and is referenced here only as the
+# filer's external metadata store. Nothing in this file provisions Postgres,
+# the local StorageClasses/PVs, or node labels — those must exist already:
+#
+#   - StorageClass "local-nvme"  -> backed by the big NVMe device, all 5 nodes
+#   - StorageClass "local-ssd"   -> backed by the small SSD device, nodes 1-3
+#     (this is the SAME independent device/partition Postgres uses — never the
+#     SeaweedFS volume disk — see plan.md "Colocation Decision")
+#   - Node labels:
+#       node-role.seaweedfs/storage=true  on all 5 nodes  (volume servers)
+#       node-role.seaweedfs/control=true  on nodes 1-3    (masters + filers)
+#
+# Every value below marked CHANGE ME is a placeholder that must be replaced
+# with real names from your cluster before installing.
+
+global:
+  seaweedfs:
+    # Cross-node replication: one replica copy on a different node, per
+    # plan.md's placement code "001". Overrides master/filer replica settings.
+    enableReplication: true
+    replicationPlacement: "001"
+    monitoring:
+      # Enables ServiceMonitors for master/volume/filer (requires the
+      # Prometheus Operator CRDs). Required for the plan's observability
+      # checklist (disk utilization, write throughput, replication lag,
+      # request rate, TTL expiry rate, metadata ops/sec).
+      enabled: true
+
+# ------------------------------------------------------------------------
+# Masters: 3 replicas, quorum + topology/volume-assignment, nodes 1-3.
+# Pod anti-affinity (max 1/node) is already the chart default.
+# ------------------------------------------------------------------------
+master:
+  replicas: 3
+
+  # Raises the per-volume file cap from the chart default (1000MB) to the
+  # conventional SeaweedFS size for a workload of many 5-10MB files, to keep
+  # the volume count (and per-volume overhead) down at 1-2M files/day.
+  volumeSizeLimitMB: 30000
+
+  nodeSelector: |
+    node-role.seaweedfs/control: "true"
+
+  # Small, non-throughput-critical state (topology/raft); lives on the
+  # general local SSD tier, never on the SeaweedFS NVMe volume storage.
+  data:
+    type: "persistentVolumeClaim"
+    size: "20Gi"
+    storageClass: "local-ssd" # CHANGE ME
+
+  # Log to stdout instead of a host-mounted log dir.
+  logs: {}
+
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+
+# ------------------------------------------------------------------------
+# Volume servers: 5 replicas, one per node (all 5), local-NVMe-backed.
+# Pod anti-affinity (max 1/node) is already the chart default.
+# ------------------------------------------------------------------------
+volume:
+  replicas: 5
+
+  # Below this free-space percentage the volume marks itself read-only —
+  # matches the plan's "alert at <20% free" threshold with an actual
+  # protective backstop, not just an alert.
+  minFreeSpacePercent: 20
+
+  nodeSelector: |
+    node-role.seaweedfs/storage: "true"
+
+  dataDirs:
+    - name: data1
+      type: "persistentVolumeClaim"
+      storageClass: "local-nvme" # CHANGE ME
+      # ~7.68TB NVMe per node, dedicated entirely to SeaweedFS (plan.md
+      # "Preferred - dual-device per node" layout), sized just under the
+      # physical disk to leave filesystem headroom.
+      size: "7000Gi"
+      maxVolumes: 0
+
+  resources:
+    requests:
+      cpu: "1"
+      memory: 2Gi
+    limits:
+      cpu: "4"
+      memory: 8Gi
+
+# ------------------------------------------------------------------------
+# Filers: 3 replicas, stateless, nodes 1-3. HTTP PUT/GET/DELETE + TTL API.
+# Metadata namespace lives in the external PostgreSQL cluster, not on the
+# filer pods themselves.
+# ------------------------------------------------------------------------
+filer:
+  replicas: 3
+
+  nodeSelector: |
+    node-role.seaweedfs/control: "true"
+
+  # No local metadata store (leveldb2 disabled below) and no local data to
+  # keep — safe to run entirely out of ephemeral storage.
+  data:
+    type: "emptyDir"
+  logs: {}
+
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+
+  # PostgreSQL filer store (plan.md "The Metadata Store Question"). Disables
+  # the chart's default embedded leveldb2 store so Postgres is the only
+  # namespace index. WEED_MYSQL_ENABLED stays at its chart default (false).
+  extraEnvironmentVars:
+    WEED_LEVELDB2_ENABLED: "false"
+    WEED_POSTGRES_ENABLED: "true"
+    WEED_POSTGRES_HOSTNAME: "postgres-cluster-primary.postgres-namespace.svc.cluster.local" # CHANGE ME
+    WEED_POSTGRES_PORT: "5432"
+    WEED_POSTGRES_DATABASE: "seaweedfs"
+    WEED_POSTGRES_SSLMODE: "require"
+    WEED_POSTGRES_CONNECTION_MAX_IDLE: "10"
+    WEED_POSTGRES_CONNECTION_MAX_OPEN: "50"
+    WEED_POSTGRES_CONNECTION_MAX_LIFETIME_SECONDS: "600"
+
+  # Credentials come from the Secret Crunchy PGO generates for the "seaweedfs"
+  # Postgres user (keys: user, password) — never inline them here.
+  secretExtraEnvironmentVars:
+    WEED_POSTGRES_USERNAME:
+      secretKeyRef:
+        name: "postgres-cluster-pguser-seaweedfs" # CHANGE ME
+        key: user
+    WEED_POSTGRES_PASSWORD:
+      secretKeyRef:
+        name: "postgres-cluster-pguser-seaweedfs" # CHANGE ME
+        key: password
+
+# ------------------------------------------------------------------------
+# Not part of this deployment (no S3/SFTP/Admin-UI/worker/COSI in the plan —
+# clients talk to the filer's native HTTP PUT/GET/DELETE API). All already
+# default to disabled; restated here to make the decision explicit.
+# ------------------------------------------------------------------------
+s3:
+  enabled: false
+sftp:
+  enabled: false
+admin:
+  enabled: false
+worker:
+  enabled: false
+allInOne:
+  enabled: false
+cosi:
+  enabled: false
+
+# ------------------------------------------------------------------------
+# NetworkPolicy: restricts PostgreSQL access to filer pods only, and allows
+# producer/consumer workloads to reach the filer's HTTP API.
+# ------------------------------------------------------------------------
+networkPolicy:
+  enabled: true
+  egress:
+    enabled: true
+    # kubeApiServer.cidrs is only required if COSI is enabled or a volume PVC
+    # is resized while this policy is on — neither applies on a fresh
+    # install. Fill in before ever growing a volume dataDir size in place.
+    kubeApiServer:
+      cidrs: [] # CHANGE ME if you later resize a volume PVC with this policy on
+  components:
+    filer:
+      # Only the filer may reach PostgreSQL — masters/volumes are not given
+      # this rule. Match this to your Postgres pods' actual labels (Crunchy
+      # PGO labels its pods postgres-operator.crunchydata.com/cluster=<name>
+      # and .../role=primary).
+      extraEgress:
+        - to:
+            - podSelector:
+                matchLabels:
+                  postgres-operator.crunchydata.com/cluster: "postgres-cluster" # CHANGE ME
+          ports:
+            - protocol: TCP
+              port: 5432
+      # Allow the producer/consumer compute workloads (outside this release)
+      # to reach the filer's HTTP API. Replace with your workloads' actual
+      # namespace/pod selector.
+      extraIngress:
+        - from:
+            - namespaceSelector:
+                matchLabels:
+                  kubernetes.io/metadata.name: "compute-workloads" # CHANGE ME
+          ports:
+            - protocol: TCP
+              port: 8888
