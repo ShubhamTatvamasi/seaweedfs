@@ -149,15 +149,57 @@ filer:
         key: password
 
 # ------------------------------------------------------------------------
-# Not part of this deployment (no S3/SFTP/Admin-UI/worker/COSI in the plan —
-# clients talk to the filer's native HTTP PUT/GET/DELETE API). All already
-# default to disabled; restated here to make the decision explicit.
+# Admin UI (dashboard): cluster/volume/task visibility and management.
+# Runs on the control nodes alongside masters/filers. Single replica — it's
+# a UI/control surface, not on the write/read data path (losing it briefly
+# on a node failure doesn't affect filer PUT/GET).
+# ------------------------------------------------------------------------
+admin:
+  enabled: true
+  replicas: 1
+
+  nodeSelector: |
+    node-role.seaweedfs/control: "true"
+
+  # Auth: the dashboard can trigger cluster/task operations, so it must not
+  # run with adminPassword empty (chart default) — that disables auth
+  # entirely. Credentials come from a Secret, never inlined here.
+  secret:
+    existingSecret: "seaweedfs-admin-credentials" # CHANGE ME — Secret with keys below
+    userKey: "username"
+    pwKey: "password"
+
+  # Small config/task-history state; persisted so it survives pod restarts.
+  # Not the SeaweedFS volume data path — fine on the general local-ssd tier.
+  dataDir: "/data"
+  data:
+    type: "persistentVolumeClaim"
+    size: "5Gi"
+    storageClass: "local-ssd" # CHANGE ME
+  logs: {}
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  # Not exposed via ingress here — reach it through kubectl port-forward or
+  # your own ingress in front of the ClusterIP service. Set ingress.enabled
+  # (+ host/className) if you want it routable without a port-forward.
+  ingress:
+    enabled: false
+
+# ------------------------------------------------------------------------
+# Not part of this deployment (no S3/SFTP/worker/COSI in the plan — clients
+# talk to the filer's native HTTP PUT/GET/DELETE API). All already default
+# to disabled; restated here to make the decision explicit.
 # ------------------------------------------------------------------------
 s3:
   enabled: false
 sftp:
-  enabled: false
-admin:
   enabled: false
 worker:
   enabled: false
@@ -204,3 +246,15 @@ networkPolicy:
           ports:
             - protocol: TCP
               port: 8888
+    admin:
+      # Lets whoever/whatever reaches the dashboard get past this policy —
+      # e.g. an ingress controller, or an ops-access namespace if you're
+      # port-forwarding via a jump pod. Replace with your actual selector.
+      extraIngress:
+        - from:
+            - namespaceSelector:
+                matchLabels:
+                  kubernetes.io/metadata.name: "ops-access" # CHANGE ME
+          ports:
+            - protocol: TCP
+              port: 23646
