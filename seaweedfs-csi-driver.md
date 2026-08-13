@@ -11,7 +11,8 @@ helm upgrade -i seaweedfs-csi-driver seaweedfs-csi-driver/seaweedfs-csi-driver \
   --namespace seaweedfs-csi-driver \
   --create-namespace \
   --set isDefaultStorageClass=true \
-  --set seaweedfsFiler=seaweedfs-filer-client.seaweedfs.svc.cluster.local:8888
+  --set seaweedfsFiler=seaweedfs-filer-client.seaweedfs.svc.cluster.local:8888 \
+  --set storageClassVolumeBindingMode=WaitForFirstConsumer
 ```
 
 ---
